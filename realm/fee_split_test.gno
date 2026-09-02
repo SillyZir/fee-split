@@ -1,432 +1,560 @@
 package fee_split
 
 import (
+	"chain"
+	"chain/banker"
 	"strings"
 	"testing"
 
+	"gno.land/p/nt/testutils/v0"
 	"gno.land/p/nt/uassert/v0"
+)
+
+var (
+	owner    = testutils.TestAddress("owner")
+	alice    = testutils.TestAddress("alice")
+	bob      = testutils.TestAddress("bob")
+	carol    = testutils.TestAddress("carol")
+	dave     = testutils.TestAddress("dave")
+	attacker = testutils.TestAddress("attacker")
 )
 
 // resetState resets all package-level state between tests.
 // Required because Gno test functions share the same VM context.
 func resetState() {
 	splits = make(map[string]*Split)
+	splitIDs = []string{}
+	ownerSplits = make(map[address]int)
 	nextID = 1
+}
+
+func addrList(addrs ...address) string {
+	parts := make([]string, len(addrs))
+	for i, a := range addrs {
+		parts[i] = string(a)
+	}
+	return strings.Join(parts, ",")
+}
+
+// fund gives the realm's package address coins so Claim payouts succeed,
+// mirroring the deposits the accounting records.
+func fund(amount int64) {
+	pkgAddr := chain.PackageAddress("gno.land/r/fee_split")
+	testing.IssueCoins(pkgAddr, chain.Coins{{Denom: Denom, Amount: amount}})
+}
+
+// deposit performs a coin-backed deposit as addr.
+func deposit(addr address, splitID string, amount int64) {
+	testing.SetRealm(testing.NewUserRealm(addr))
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: amount}})
+	fund(amount)
+	Deposit(cross, splitID)
+	testing.SetOriginSend(nil)
 }
 
 // ---------- CreateSplit ----------
 
-func TestCreateSplit_Basic(t *testing.T) {
+func TestCreateSplit_Basic(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "6000,4000")
+	id := CreateSplit(cross, addrList(alice, bob), "6000,4000")
 	uassert.Equal(t, "split_1", id)
 
 	s := splits["split_1"]
-	uassert.Equal(t, "g1owner", s.Owner)
+	uassert.Equal(t, string(owner), string(s.Owner))
 	uassert.Equal(t, 2, len(s.Recipients))
-	uassert.Equal(t, "g1alice", s.Recipients[0])
-	uassert.Equal(t, "g1bob", s.Recipients[1])
-	uassert.Equal(t, uint64(6000), s.Shares[0])
-	uassert.Equal(t, uint64(4000), s.Shares[1])
+	uassert.Equal(t, string(alice), string(s.Recipients[0]))
+	uassert.Equal(t, string(bob), string(s.Recipients[1]))
+	uassert.Equal(t, int64(6000), s.Shares[0])
+	uassert.Equal(t, int64(4000), s.Shares[1])
 	uassert.False(t, s.Frozen, "new split must not be frozen")
-	uassert.Equal(t, uint64(0), s.TotalDeposited)
-	uassert.Equal(t, uint64(0), s.TotalClaimed)
+	uassert.Equal(t, int64(0), s.TotalDeposited)
+	uassert.Equal(t, int64(0), s.TotalClaimed)
 }
 
-func TestCreateSplit_IDsIncrement(t *testing.T) {
+func TestCreateSplit_IDsIncrement(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	id1 := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	id2 := CreateSplit(cross, "g1owner", "g1bob", "10000")
+	id1 := CreateSplit(cross, addrList(alice), "10000")
+	id2 := CreateSplit(cross, addrList(bob), "10000")
 	uassert.Equal(t, "split_1", id1)
 	uassert.Equal(t, "split_2", id2)
 }
 
-func TestCreateSplit_SingleRecipient(t *testing.T) {
+func TestCreateSplit_DuplicateRecipient(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	uassert.Equal(t, "split_1", id)
-}
-
-func TestCreateSplit_DuplicateRecipient(t *testing.T) {
-	resetState()
-
-	uassert.PanicsWithMessage(t,
-		"duplicate recipient: g1alice",
-		func() { CreateSplit(cross, "g1owner", "g1alice,g1alice", "5000,5000") },
+	uassert.AbortsWithMessage(t,
+		"duplicate recipient: "+string(alice),
+		func() { CreateSplit(cross, addrList(alice, alice), "5000,5000") },
 	)
 }
 
-func TestCreateSplit_SharesDontSum(t *testing.T) {
+func TestCreateSplit_SharesDontSum(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	uassert.PanicsWithMessage(t,
+	uassert.AbortsWithMessage(t,
 		"shares must sum to 10000 basis points, got 5000",
-		func() { CreateSplit(cross, "g1owner", "g1alice", "5000") },
+		func() { CreateSplit(cross, addrList(alice), "5000") },
 	)
 }
 
-func TestCreateSplit_LengthMismatch(t *testing.T) {
+func TestCreateSplit_LengthMismatch(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	uassert.PanicsWithMessage(t,
+	uassert.AbortsWithMessage(t,
 		"recipients and shares must have the same length",
-		func() { CreateSplit(cross, "g1owner", "g1alice,g1bob", "10000") },
+		func() { CreateSplit(cross, addrList(alice, bob), "10000") },
 	)
 }
 
-func TestCreateSplit_EmptyRecipient(t *testing.T) {
+func TestCreateSplit_InvalidAddressRejected(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	uassert.PanicsWithMessage(t,
-		"empty recipient address at position 1",
-		func() { CreateSplit(cross, "g1owner", "g1alice,", "5000,5000") },
+	uassert.AbortsWithMessage(t,
+		"invalid recipient address: not_an_address",
+		func() { CreateSplit(cross, "not_an_address", "10000") },
 	)
 }
 
-func TestCreateSplit_NoRecipients(t *testing.T) {
+func TestCreateSplit_PerOwnerLimit(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	// parseBasisPoints will panic on empty string before the length check
-	// but if recipients list is somehow empty after split, at-least-one check fires
-	uassert.PanicsWithMessage(t,
-		"invalid share value: ",
-		func() { CreateSplit(cross, "g1owner", "g1alice", "") },
+	for i := 0; i < MaxSplitsPerOwner; i++ {
+		CreateSplit(cross, addrList(alice), "10000")
+	}
+	uassert.AbortsWithMessage(t,
+		"per-owner split limit reached",
+		func() { CreateSplit(cross, addrList(alice), "10000") },
 	)
 }
 
-// ---------- Deposit ----------
+// ---------- Deposit (coin-backed) ----------
 
-func TestDeposit_EvenSplit(t *testing.T) {
+func TestDeposit_UsesSentCoins(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-
-	Deposit(cross, id, 1000)
+	deposit(owner, id, 1000)
 
 	s := splits[id]
-	uassert.Equal(t, uint64(1000), s.TotalDeposited)
-	uassert.Equal(t, uint64(500), s.Balances["g1alice"])
-	uassert.Equal(t, uint64(500), s.Balances["g1bob"])
+	uassert.Equal(t, int64(1000), s.TotalDeposited)
+	uassert.Equal(t, int64(500), s.Balances[alice])
+	uassert.Equal(t, int64(500), s.Balances[bob])
 }
 
-func TestDeposit_UnevenSplit(t *testing.T) {
+func TestDeposit_NoCoinsPanics(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob,g1carol", "6000,2500,1500")
-
-	Deposit(cross, id, 1000000)
-
-	s := splits[id]
-	uassert.Equal(t, uint64(1000000), s.TotalDeposited)
-	uassert.Equal(t, uint64(600000), s.Balances["g1alice"])
-	uassert.Equal(t, uint64(250000), s.Balances["g1bob"])
-	uassert.Equal(t, uint64(150000), s.Balances["g1carol"])
-}
-
-func TestDeposit_RoundingDustGoesToLastRecipient(t *testing.T) {
-	resetState()
-
-	// 3-way split with indivisible amount: each gets floor, last gets remainder
-	// alice=3333, bob=3333, carol=3334 (dust)
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob,g1carol", "3334,3333,3333")
-
-	Deposit(cross, id, 10)
-
-	s := splits[id]
-	uassert.Equal(t, uint64(10), s.TotalDeposited)
-
-	// alice: (10 * 3334) / 10000 = 3
-	uassert.Equal(t, uint64(3), s.Balances["g1alice"])
-	// bob: (10 * 3333) / 10000 = 3
-	uassert.Equal(t, uint64(3), s.Balances["g1bob"])
-	// carol (last): 10 - 3 - 3 = 4
-	uassert.Equal(t, uint64(4), s.Balances["g1carol"])
-}
-
-func TestDeposit_AccumulatesAcrossMultipleDeposits(t *testing.T) {
-	resetState()
-
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-
-	Deposit(cross, id, 100)
-	Deposit(cross, id, 200)
-
-	s := splits[id]
-	uassert.Equal(t, uint64(300), s.TotalDeposited)
-	uassert.Equal(t, uint64(150), s.Balances["g1alice"])
-	uassert.Equal(t, uint64(150), s.Balances["g1bob"])
-}
-
-func TestDeposit_ZeroAmountPanics(t *testing.T) {
-	resetState()
-
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-
-	uassert.PanicsWithMessage(t,
-		"amount must be greater than zero",
-		func() { Deposit(cross, id, 0) },
+	// no SetOriginSend: nothing attached to the call
+	testing.SetOriginSend(nil)
+	uassert.AbortsWithMessage(t,
+		"deposit must send exactly one coin of "+Denom,
+		func() { Deposit(cross, id) },
 	)
+	uassert.Equal(t, int64(0), splits[id].TotalDeposited)
 }
 
-func TestDeposit_FrozenSplitPanics(t *testing.T) {
+func TestDeposit_WrongDenomPanics(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Freeze(cross, id, "g1owner")
+	testing.SetOriginSend(chain.Coins{{Denom: "ufoo", Amount: 100}})
+	uassert.AbortsWithMessage(t,
+		"deposit must send exactly one coin of "+Denom,
+		func() { Deposit(cross, id) },
+	)
+	testing.SetOriginSend(nil)
+}
 
-	uassert.PanicsWithMessage(t,
+func TestDeposit_RoundingDustGoesToHighestShare(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob, carol), "3334,3333,3333")
+
+	deposit(owner, id, 10)
+
+	s := splits[id]
+	uassert.Equal(t, int64(10), s.TotalDeposited)
+	// alice: (10*3334)/10000 = 3, +1 dust (highest share)
+	uassert.Equal(t, int64(4), s.Balances[alice])
+	uassert.Equal(t, int64(3), s.Balances[bob])
+	uassert.Equal(t, int64(3), s.Balances[carol])
+}
+
+func TestDeposit_AccumulatesAcrossMultipleDeposits(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+
+	deposit(owner, id, 100)
+	deposit(owner, id, 200)
+
+	s := splits[id]
+	uassert.Equal(t, int64(300), s.TotalDeposited)
+	uassert.Equal(t, int64(150), s.Balances[alice])
+	uassert.Equal(t, int64(150), s.Balances[bob])
+}
+
+func TestDeposit_OverflowGuard(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: MaxDepositAmount + 1}})
+	uassert.AbortsWithMessage(t,
+		"deposit exceeds maximum supported amount",
+		func() { Deposit(cross, id) },
+	)
+	testing.SetOriginSend(nil)
+	uassert.Equal(t, int64(0), splits[id].TotalDeposited)
+}
+
+func TestDeposit_FrozenSplitPanics(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	Freeze(cross, id)
+
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: 100}})
+	uassert.AbortsWithMessage(t,
 		"split is frozen",
-		func() { Deposit(cross, id, 100) },
+		func() { Deposit(cross, id) },
 	)
+	testing.SetOriginSend(nil)
 }
 
-func TestDeposit_UnknownSplitPanics(t *testing.T) {
+func TestDeposit_UnknownSplitPanics(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
 
-	uassert.PanicsWithMessage(t,
+	uassert.AbortsWithMessage(t,
 		"split not found: split_99",
-		func() { Deposit(cross, "split_99", 100) },
+		func() { Deposit(cross, "split_99") },
 	)
 }
 
-// ---------- Claim ----------
+// ---------- Claim (pays out coins) ----------
 
-func TestClaim_Basic(t *testing.T) {
+func TestClaim_SendsCoins(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "7000,3000")
+	deposit(owner, id, 10000)
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "7000,3000")
-	Deposit(cross, id, 10000)
+	before := banker.NewBanker(banker.BankerTypeReadonly).GetCoins(alice).AmountOf(Denom)
 
-	claimed := Claim(cross, id, "g1alice")
-	uassert.Equal(t, uint64(7000), claimed)
+	testing.SetRealm(testing.NewUserRealm(alice))
+	claimed := Claim(cross, id)
+	uassert.Equal(t, int64(7000), claimed)
+
+	after := banker.NewBanker(banker.BankerTypeReadonly).GetCoins(alice).AmountOf(Denom)
+	uassert.Equal(t, int64(7000), after-before)
 
 	s := splits[id]
-	uassert.Equal(t, uint64(0), s.Balances["g1alice"])
-	uassert.Equal(t, uint64(7000), s.TotalClaimed)
+	uassert.Equal(t, int64(0), s.Balances[alice])
+	uassert.Equal(t, int64(7000), s.TotalClaimed)
 }
 
-func TestClaim_NothingToClaim(t *testing.T) {
+func TestClaim_CallerIdentityIsEnforced(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100)
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-
-	uassert.PanicsWithMessage(t,
-		"nothing to claim",
-		func() { Claim(cross, id, "g1alice") },
-	)
-}
-
-func TestClaim_NotARecipient(t *testing.T) {
-	resetState()
-
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Deposit(cross, id, 100)
-
-	uassert.PanicsWithMessage(t,
+	// the attacker cannot claim alice's balance: identity comes from the
+	// chain, not from an argument
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t,
 		"not a recipient of this split",
-		func() { Claim(cross, id, "g1stranger") },
+		func() { Claim(cross, id) },
+	)
+	uassert.Equal(t, int64(100), splits[id].Balances[alice])
+}
+
+func TestClaim_NothingToClaim(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+
+	testing.SetRealm(testing.NewUserRealm(alice))
+	uassert.AbortsWithMessage(t,
+		"nothing to claim",
+		func() { Claim(cross, id) },
 	)
 }
 
-func TestClaim_CannotClaimTwice(t *testing.T) {
+func TestClaim_CannotClaimTwice(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100)
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Deposit(cross, id, 100)
-	Claim(cross, id, "g1alice")
-
-	uassert.PanicsWithMessage(t,
+	testing.SetRealm(testing.NewUserRealm(alice))
+	Claim(cross, id)
+	uassert.AbortsWithMessage(t,
 		"nothing to claim",
-		func() { Claim(cross, id, "g1alice") },
+		func() { Claim(cross, id) },
 	)
+}
+
+func TestClaim_ExRecipientKeepsAccruedBalance(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+	deposit(owner, id, 1000)
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	UpdateShares(cross, id, addrList(carol, dave), "6000,4000")
+
+	// bob was removed but keeps — and can claim — his accrued 500
+	testing.SetRealm(testing.NewUserRealm(bob))
+	claimed := Claim(cross, id)
+	uassert.Equal(t, int64(500), claimed)
 }
 
 // ---------- UpdateShares ----------
 
-func TestUpdateShares_Basic(t *testing.T) {
+func TestUpdateShares_Basic(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-	UpdateShares(cross, id, "g1owner", "g1alice,g1carol", "7000,3000")
+	UpdateShares(cross, id, addrList(alice, carol), "7000,3000")
 
 	s := splits[id]
 	uassert.Equal(t, 2, len(s.Recipients))
-	uassert.Equal(t, "g1alice", s.Recipients[0])
-	uassert.Equal(t, "g1carol", s.Recipients[1])
-	uassert.Equal(t, uint64(7000), s.Shares[0])
-	uassert.Equal(t, uint64(3000), s.Shares[1])
+	uassert.Equal(t, string(alice), string(s.Recipients[0]))
+	uassert.Equal(t, string(carol), string(s.Recipients[1]))
+	uassert.Equal(t, int64(7000), s.Shares[0])
+	uassert.Equal(t, int64(3000), s.Shares[1])
 }
 
-func TestUpdateShares_PreservesUnclaimedBalances(t *testing.T) {
+func TestUpdateShares_PreservesUnclaimedBalances(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+	deposit(owner, id, 1000)
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-	Deposit(cross, id, 1000)
-
-	// alice has 500 unclaimed; now remove her from the new recipients list
-	// but her balance entry is preserved in the map
-	UpdateShares(cross, id, "g1owner", "g1carol,g1dave", "6000,4000")
+	testing.SetRealm(testing.NewUserRealm(owner))
+	UpdateShares(cross, id, addrList(carol, dave), "6000,4000")
 
 	s := splits[id]
-	// alice's old balance is not deleted
-	uassert.Equal(t, uint64(500), s.Balances["g1alice"])
-	uassert.Equal(t, uint64(500), s.Balances["g1bob"])
+	uassert.Equal(t, int64(500), s.Balances[alice])
+	uassert.Equal(t, int64(500), s.Balances[bob])
 }
 
-func TestUpdateShares_WrongOwner(t *testing.T) {
+func TestUpdateShares_WrongOwner(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-
-	uassert.PanicsWithMessage(t,
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t,
 		"only the owner can update shares",
-		func() { UpdateShares(cross, id, "g1attacker", "g1alice", "10000") },
+		func() { UpdateShares(cross, id, addrList(alice), "10000") },
 	)
 }
 
-func TestUpdateShares_FrozenSplitPanics(t *testing.T) {
+func TestUpdateShares_FrozenSplitPanics(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	Freeze(cross, id)
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Freeze(cross, id, "g1owner")
-
-	uassert.PanicsWithMessage(t,
+	uassert.AbortsWithMessage(t,
 		"split is frozen",
-		func() { UpdateShares(cross, id, "g1owner", "g1alice,g1bob", "5000,5000") },
+		func() { UpdateShares(cross, id, addrList(alice, bob), "5000,5000") },
 	)
 }
 
 // ---------- TransferOwnership ----------
 
-func TestTransferOwnership_Basic(t *testing.T) {
+func TestTransferOwnership_Basic(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	TransferOwnership(cross, id, "g1owner", "g1newowner")
-
-	uassert.Equal(t, "g1newowner", splits[id].Owner)
+	TransferOwnership(cross, id, bob)
+	uassert.Equal(t, string(bob), string(splits[id].Owner))
 }
 
-func TestTransferOwnership_WrongOwner(t *testing.T) {
+func TestTransferOwnership_WrongOwner(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-
-	uassert.PanicsWithMessage(t,
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t,
 		"only the owner can transfer ownership",
-		func() { TransferOwnership(cross, id, "g1attacker", "g1newowner") },
+		func() { TransferOwnership(cross, id, attacker) },
 	)
 }
 
-func TestTransferOwnership_EmptyNewOwner(t *testing.T) {
+func TestTransferOwnership_MovesOwnerSlot(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	uassert.Equal(t, 1, ownerSplits[owner])
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
+	TransferOwnership(cross, id, bob)
 
-	uassert.PanicsWithMessage(t,
-		"new owner must not be empty",
-		func() { TransferOwnership(cross, id, "g1owner", "") },
+	// the creator's slot is freed; the new owner's is consumed
+	uassert.Equal(t, 0, ownerSplits[owner])
+	uassert.Equal(t, 1, ownerSplits[bob])
+
+	// and the creator can fill the freed slot again
+	for i := 0; i < MaxSplitsPerOwner; i++ {
+		CreateSplit(cross, addrList(alice), "10000")
+	}
+}
+
+func TestTransferOwnership_NewOwnerAtLimitBlocked(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(bob))
+	for i := 0; i < MaxSplitsPerOwner; i++ {
+		CreateSplit(cross, addrList(alice), "10000")
+	}
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	uassert.AbortsWithMessage(t,
+		"new owner is at the per-owner split limit",
+		func() { TransferOwnership(cross, id, bob) },
 	)
 }
 
 // ---------- Freeze ----------
 
-func TestFreeze_Basic(t *testing.T) {
+func TestFreeze_Basic(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Freeze(cross, id, "g1owner")
-
+	Freeze(cross, id)
 	uassert.True(t, splits[id].Frozen, "split must be frozen after Freeze()")
 }
 
-func TestFreeze_WrongOwner(t *testing.T) {
+func TestFreeze_WrongOwner(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-
-	uassert.PanicsWithMessage(t,
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t,
 		"only the owner can freeze",
-		func() { Freeze(cross, id, "g1attacker") },
+		func() { Freeze(cross, id) },
 	)
 }
 
-func TestFreeze_IsOneWay(t *testing.T) {
+func TestFreeze_ClaimsStillWork(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100)
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
-	Freeze(cross, id, "g1owner")
+	testing.SetRealm(testing.NewUserRealm(owner))
+	Freeze(cross, id)
 
-	// DepositAndClaim still work after freeze
-	// (only UpdateShares and Deposit are restricted — but Deposit IS blocked after freeze)
-	uassert.True(t, splits[id].Frozen)
+	testing.SetRealm(testing.NewUserRealm(alice))
+	uassert.Equal(t, int64(100), Claim(cross, id))
 }
 
-// ---------- GetClaimable ----------
+// ---------- Archive ----------
 
-func TestGetClaimable(t *testing.T) {
+func TestArchive_BlocksWithOutstandingBalance(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100)
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "8000,2000")
-	Deposit(cross, id, 5000)
-
-	uassert.Equal(t, uint64(4000), GetClaimable(id, "g1alice"))
-	uassert.Equal(t, uint64(1000), GetClaimable(id, "g1bob"))
+	testing.SetRealm(testing.NewUserRealm(owner))
+	uassert.AbortsWithMessage(t,
+		"cannot archive: outstanding balance for "+string(alice),
+		func() { Archive(cross, id) },
+	)
 }
 
-func TestGetClaimable_ZeroForUnknown(t *testing.T) {
+func TestArchive_BlocksOnExRecipientBalance(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+	deposit(owner, id, 1000)
 
-	id := CreateSplit(cross, "g1owner", "g1alice", "10000")
+	testing.SetRealm(testing.NewUserRealm(owner))
+	// remove bob; his 500 stays claimable
+	UpdateShares(cross, id, addrList(alice), "10000")
+	testing.SetRealm(testing.NewUserRealm(alice))
+	Claim(cross, id)
 
-	// g1stranger is not a recipient — Balances map returns zero for missing key
-	uassert.Equal(t, uint64(0), GetClaimable(id, "g1stranger"))
+	// archive must refuse while the EX-recipient still has a balance —
+	// archiving would lock his claim forever
+	testing.SetRealm(testing.NewUserRealm(owner))
+	uassert.AbortsWithMessage(t,
+		"cannot archive: outstanding balance for "+string(bob),
+		func() { Archive(cross, id) },
+	)
+
+	// once bob claims, archive succeeds
+	testing.SetRealm(testing.NewUserRealm(bob))
+	Claim(cross, id)
+	testing.SetRealm(testing.NewUserRealm(owner))
+	Archive(cross, id)
+	uassert.True(t, splits[id].Archived, "split must be archived")
 }
 
-// ---------- GetSplitInfo ----------
+// ---------- queries ----------
 
-func TestGetSplitInfo_ContainsExpectedFields(t *testing.T) {
+func TestGetClaimable(cur realm, t *testing.T) {
 	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "8000,2000")
+	deposit(owner, id, 5000)
 
-	id := CreateSplit(cross, "g1owner", "g1alice,g1bob", "5000,5000")
-	Deposit(cross, id, 200)
+	uassert.Equal(t, int64(4000), GetClaimable(id, alice))
+	uassert.Equal(t, int64(1000), GetClaimable(id, bob))
+	uassert.Equal(t, int64(0), GetClaimable(id, attacker))
+}
+
+func TestGetSplitInfo_ContainsExpectedFields(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+	deposit(owner, id, 200)
 
 	info := GetSplitInfo(id)
-
 	uassert.True(t, strings.Contains(info, "Owner"), "GetSplitInfo output must contain 'Owner'")
-	uassert.True(t, strings.Contains(info, "g1owner"), "GetSplitInfo output must contain owner address")
-	uassert.True(t, strings.Contains(info, "g1alice"), "GetSplitInfo output must contain recipient")
+	uassert.True(t, strings.Contains(info, string(owner)), "GetSplitInfo output must contain owner address")
+	uassert.True(t, strings.Contains(info, string(alice)), "GetSplitInfo output must contain recipient")
 }
 
-func TestGetSplitInfo_UnknownSplitPanics(t *testing.T) {
-	resetState()
+// ---------- render ----------
 
-	uassert.PanicsWithMessage(t,
-		"split not found: split_99",
-		func() { GetSplitInfo("split_99") },
-	)
-}
-
-// ---------- Render ----------
-
-func TestRender_EmptyState(t *testing.T) {
+func TestRender_EmptyState(cur realm, t *testing.T) {
 	resetState()
 
 	out := Render("")
 	uassert.Equal(t, "# Fee Split\n\nNo active splits.\n", out)
 }
 
-func TestRender_WithSplits(t *testing.T) {
+func TestRender_WithSplits(cur realm, t *testing.T) {
 	resetState()
-
-	CreateSplit(cross, "g1owner", "g1alice,g1bob", "6000,4000")
-	Deposit(cross, "split_1", 1000)
+	testing.SetRealm(testing.NewUserRealm(owner))
+	CreateSplit(cross, addrList(alice, bob), "6000,4000")
+	deposit(owner, "split_1", 1000)
 
 	out := Render("")
-
 	uassert.True(t, strings.Contains(out, "split_1"), "Render output must reference split_1")
-	uassert.True(t, strings.Contains(out, "g1owner"), "Render output must include owner")
+	uassert.True(t, strings.Contains(out, string(owner)), "Render output must include owner")
 }
