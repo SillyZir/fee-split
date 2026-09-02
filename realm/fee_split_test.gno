@@ -629,3 +629,36 @@ func TestDeposit_CodeRealmRefused(cur realm, t *testing.T) {
 	)
 	testing.SetOriginSend(nil)
 }
+
+// ---------- round-3 audit regressions (2026-09-02) ----------
+
+func TestUppercaseAddressesRejected(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+
+	// round-3 P2: all-uppercase bech32 passes IsValid but can never
+	// match caller(): as a recipient it locks funds and blocks Archive;
+	// as upper/lower twins it bypasses the duplicate check; as an owner
+	// it orphans the split
+	upper := strings.ToUpper(string(alice))
+	uassert.AbortsWithMessage(t,
+		"invalid recipient address: "+upper,
+		func() { CreateSplit(cross, string(alice)+","+upper, "5000,5000") },
+	)
+
+	id := CreateSplit(cross, addrList(alice), "10000")
+	uassert.AbortsWithMessage(t,
+		"invalid new owner address: "+upper,
+		func() { TransferOwnership(cross, id, address(upper)) },
+	)
+}
+
+func TestRender_OnlyArchivedSplits(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	Archive(cross, id)
+
+	uassert.Equal(t, "# Fee Split\n\nNo active splits.\n", Render(""),
+		"archived-only state must render as no active splits")
+}

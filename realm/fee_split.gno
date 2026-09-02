@@ -117,7 +117,12 @@ func parseAddresses(raw string) []address {
 		if a == "" {
 			panic("empty recipient address at position " + strconv.Itoa(i))
 		}
-		if !a.IsValid() {
+		if !a.IsValid() || string(a) != strings.ToLower(string(a)) {
+			// lowercase is required, not cosmetic (round-3 audit): bech32
+			// accepts ALL-UPPERCASE as valid, but caller() always returns
+			// the lowercase canonical form — an uppercase-keyed balance
+			// could never be claimed and would block Archive forever, and
+			// upper/lower duplicates would bypass the duplicate check
 			panic("invalid recipient address: " + string(a))
 		}
 		// NOTE: IsValid is a format check only — a well-formed address with
@@ -210,7 +215,13 @@ func CreateSplit(_ realm, recipientList, shareList string) string {
 }
 
 // Deposit distributes the coins sent with the call across recipients
-// proportionally. The deposit is the ACTUAL attached send — exactly one
+// proportionally.
+//
+// LIMITATION (round-3 audit, documented): only direct user calls can
+// deposit. A DAO/realm treasury has NO deposit path — a realm-routed
+// call is refused, and a bare banker send to this realm's address is
+// an unrecoverable donation. Realm treasuries must route deposits
+// through a user account. The deposit is the ACTUAL attached send — exactly one
 // coin of Denom — so balances are always backed by funds this realm
 // holds. Direct user calls only: a deposit routed through an
 // intermediary realm would deliver its coins to that realm, not here,
@@ -332,7 +343,9 @@ func TransferOwnership(_ realm, splitID string, newOwner address) {
 	if newOwner == "" {
 		panic("new owner must not be empty")
 	}
-	if !newOwner.IsValid() {
+	if !newOwner.IsValid() || string(newOwner) != strings.ToLower(string(newOwner)) {
+		// see parseAddresses: an uppercase owner could never match
+		// caller() again — the split would be permanently owner-less
 		panic("invalid new owner address: " + string(newOwner))
 	}
 	if newOwner == s.Owner {
@@ -424,7 +437,7 @@ func GetClaimable(splitID string, addr address) int64 {
 
 // Render returns a markdown overview. Never panics.
 func Render(path string) string {
-	if splits == nil || len(splits) == 0 {
+	if len(splitIDs) == 0 {
 		return "# Fee Split\n\nNo active splits.\n"
 	}
 
