@@ -94,7 +94,10 @@ func parseBasisPoints(raw string) []int64 {
 	var total int64
 	for i, s := range parts {
 		v, err := strconv.Atoi(strings.TrimSpace(s))
-		if err != nil || v <= 0 {
+		if err != nil || v <= 0 || v > 10000 {
+			// the upper bound is a security invariant, not hygiene: unbounded
+			// shares let the int64 total wrap back to exactly 10000, minting
+			// unbacked balances paid from the shared pool (re-audit P1)
 			panic("invalid share value: " + strings.TrimSpace(s))
 		}
 		out[i] = int64(v)
@@ -117,6 +120,10 @@ func parseAddresses(raw string) []address {
 		if !a.IsValid() {
 			panic("invalid recipient address: " + string(a))
 		}
+		// NOTE: IsValid is a format check only — a well-formed address with
+		// no key holder (e.g. another package's derived address) will
+		// accumulate a balance nobody can claim, which also blocks Archive
+		// forever. Owners must list addresses they know can call Claim.
 		out[i] = a
 	}
 	return out
@@ -152,13 +159,26 @@ func sortedBalanceAddrs(s *Split) []string {
 	return addrs
 }
 
+// rejectStraySend aborts when coins are attached to a call that does not
+// accept them — the abort reverts the transfer back to the sender instead
+// of stranding the coins on the realm address (re-audit P3). Direct bank
+// transfers to the realm address remain unrecoverable by design.
+func rejectStraySend() {
+	if runtime.PreviousRealm().IsUserCall() && len(banker.OriginSend()) > 0 {
+		panic("this function does not accept coins; attach coins to Deposit only")
+	}
+}
+
 // ---------- write operations ----------
 
 // CreateSplit registers a new split. The caller becomes the owner.
 // Recipients and shares are comma-separated; shares are in basis points
 // summing to 10000.
 func CreateSplit(_ realm, recipientList, shareList string) string {
-	if len(splits) >= MaxSplitsGlobal {
+	rejectStraySend()
+	if len(splitIDs) >= MaxSplitsGlobal {
+		// splitIDs holds ACTIVE splits only — archived entries stay in the
+		// splits map for audit but must not consume the cap forever
 		panic("global split limit reached")
 	}
 	owner := caller()
@@ -202,8 +222,12 @@ func Deposit(_ realm, splitID string) {
 		panic("split is frozen")
 	}
 
-	if !runtime.PreviousRealm().IsUser() {
-		panic("deposits must be sent directly, not through another realm")
+	// IsUserCall, not IsUser: MsgRun passes IsUser but its attached send
+	// goes caller->caller — the coins never reach this realm, and OriginSend
+	// could be re-read across k calls in one run script (re-audit P1). A
+	// direct MsgCall's send provably lands on the called package address.
+	if !runtime.PreviousRealm().IsUserCall() {
+		panic("deposits must be sent by direct call, not through another realm or a run script")
 	}
 	sent := banker.OriginSend()
 	if len(sent) != 1 || sent[0].Denom != Denom {
@@ -249,6 +273,7 @@ func Deposit(_ realm, splitID string) {
 // Claims remain possible on frozen splits, and by ex-recipients whose
 // accrued balance predates a share update.
 func Claim(_ realm, splitID string) int64 {
+	rejectStraySend()
 	s := mustGetActive(splitID)
 	addr := caller()
 
@@ -272,6 +297,7 @@ func Claim(_ realm, splitID string) int64 {
 // UpdateShares replaces recipients and shares. Owner only. Not if frozen.
 // Removed recipients keep any accrued balance and can still Claim it.
 func UpdateShares(_ realm, splitID, recipientList, shareList string) {
+	rejectStraySend()
 	s := mustGetActive(splitID)
 	if caller() != s.Owner {
 		panic("only the owner can update shares")
@@ -298,6 +324,7 @@ func UpdateShares(_ realm, splitID, recipientList, shareList string) {
 // slot moves with it: the old owner's count is freed and the new
 // owner's is consumed (and must be under the limit).
 func TransferOwnership(_ realm, splitID string, newOwner address) {
+	rejectStraySend()
 	s := mustGetActive(splitID)
 	if caller() != s.Owner {
 		panic("only the owner can transfer ownership")
@@ -326,6 +353,7 @@ func TransferOwnership(_ realm, splitID string, newOwner address) {
 // Freeze permanently locks shares and stops further deposits. One-way,
 // cannot be undone. Claims remain possible.
 func Freeze(_ realm, splitID string) {
+	rejectStraySend()
 	s := mustGetActive(splitID)
 	if caller() != s.Owner {
 		panic("only the owner can freeze")
@@ -338,6 +366,7 @@ func Freeze(_ realm, splitID string) {
 // ex-recipients removed in a share update — is zero, since archiving
 // blocks all further claims. Cannot be undone.
 func Archive(_ realm, splitID string) {
+	rejectStraySend()
 	s := mustGetActive(splitID)
 	if caller() != s.Owner {
 		panic("only the owner can archive")

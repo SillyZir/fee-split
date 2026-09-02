@@ -558,3 +558,74 @@ func TestRender_WithSplits(cur realm, t *testing.T) {
 	uassert.True(t, strings.Contains(out, "split_1"), "Render output must reference split_1")
 	uassert.True(t, strings.Contains(out, string(owner)), "Render output must include owner")
 }
+
+// ---------- re-audit regressions (2026-09-02) ----------
+
+func TestCreateSplit_ShareSumWraparoundRejected(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+
+	// re-audit P1: these shares sum past 2^64 back to exactly 10000; the
+	// per-share <=10000 bound must refuse them before the sum can wrap
+	uassert.AbortsWithMessage(t,
+		"invalid share value: 1152921505606846976",
+		func() {
+			CreateSplit(cross, addrList(alice, bob, carol),
+				"1152921505606846976,8646911284051357320,8646911284051357320")
+		},
+	)
+	uassert.AbortsWithMessage(t,
+		"invalid share value: 10001",
+		func() { CreateSplit(cross, addrList(alice, bob), "10001,10000") },
+	)
+}
+
+func TestGlobalCap_CountsActiveOnly(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+
+	// re-audit P2: archived splits keep their audit record but must free
+	// their global slot — archive one, and creation must still work
+	id := CreateSplit(cross, addrList(alice), "10000")
+	Archive(cross, id)
+	uassert.Equal(t, 1, len(splits), "archived entry stays for audit")
+	uassert.Equal(t, 0, len(splitIDs), "archived entry frees the active list")
+	CreateSplit(cross, addrList(alice), "10000") // must not abort
+}
+
+func TestStraySendRejected(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100)
+
+	// re-audit P3: coins attached to a non-Deposit call must abort (and
+	// therefore revert to the sender), never strand on the realm address
+	testing.SetRealm(testing.NewUserRealm(alice))
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: 50}})
+	uassert.AbortsWithMessage(t,
+		"this function does not accept coins; attach coins to Deposit only",
+		func() { Claim(cross, id) },
+	)
+	testing.SetOriginSend(nil)
+
+	// without coins attached the same claim succeeds
+	uassert.Equal(t, int64(100), Claim(cross, id))
+}
+
+func TestDeposit_CodeRealmRefused(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+
+	// re-audit P1 companion: only a direct user MsgCall may deposit — a
+	// code realm as previous realm must be refused (its send would not
+	// have landed here)
+	testing.SetRealm(testing.NewCodeRealm("gno.land/r/demo/intermediary"))
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: 100}})
+	uassert.AbortsContains(t,
+		"deposits must be sent by direct call",
+		func() { Deposit(cross, id) },
+	)
+	testing.SetOriginSend(nil)
+}
