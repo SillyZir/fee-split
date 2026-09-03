@@ -25,7 +25,18 @@ type Split struct {
 const (
 	MaxRecipients     = 20
 	MaxSplitsPerOwner = 10
-	MaxSplitsGlobal   = 500
+	// Quotas are PER-OWNER only (round-4 audit): a global cap is a shared
+	// resource 50 sybil accounts could fill forever — and seeding grief
+	// splits with balances to keyless recipients made the fill
+	// unrecoverable even by the sybils. Per-owner quotas mean an attacker
+	// consumes only their own budget; state growth is gas-priced.
+	// Render is bounded separately (MaxRenderSplits).
+	MaxRenderSplits = 100
+	// Pre-parse input bounds (round-4 audit): caps were enforced only
+	// AFTER full parsing, so a 1MB recipient list burned ~11B gas before
+	// refusal. 20 bech32 addresses + separators fit well within these.
+	MaxRecipientListLen = 1024
+	MaxShareListLen     = 128
 
 	// Denomination handled by this realm. Deposits must be exactly one
 	// coin of this denom; claims pay out in it.
@@ -89,6 +100,9 @@ func boolStr(v bool) string {
 }
 
 func parseBasisPoints(raw string) []int64 {
+	if len(raw) > MaxShareListLen {
+		panic("share list too long")
+	}
 	parts := strings.Split(raw, ",")
 	out := make([]int64, len(parts))
 	var total int64
@@ -110,6 +124,9 @@ func parseBasisPoints(raw string) []int64 {
 }
 
 func parseAddresses(raw string) []address {
+	if len(raw) > MaxRecipientListLen {
+		panic("recipient list too long")
+	}
 	parts := strings.Split(raw, ",")
 	out := make([]address, len(parts))
 	for i, r := range parts {
@@ -181,11 +198,6 @@ func rejectStraySend() {
 // summing to 10000.
 func CreateSplit(_ realm, recipientList, shareList string) string {
 	rejectStraySend()
-	if len(splitIDs) >= MaxSplitsGlobal {
-		// splitIDs holds ACTIVE splits only — archived entries stay in the
-		// splits map for audit but must not consume the cap forever
-		panic("global split limit reached")
-	}
 	owner := caller()
 	if ownerSplits[owner] >= MaxSplitsPerOwner {
 		panic("per-owner split limit reached")
@@ -216,6 +228,14 @@ func CreateSplit(_ realm, recipientList, shareList string) string {
 
 // Deposit distributes the coins sent with the call across recipients
 // proportionally.
+//
+// DEPLOYMENT PRECONDITION (round-4 audit): on a network with
+// restricted/token-locked ugnot transfers, the bank gate is
+// SENDER-whitelist-based — a whitelisted user's Deposit succeeds but
+// Claim sends FROM this realm's (non-whitelisted) address and reverts.
+// Funds would flow in and not out until the restriction lifts. Deploy
+// only to networks with unrestricted ugnot, or have governance
+// whitelist this realm's address first.
 //
 // LIMITATION (round-3 audit, documented): only direct user calls can
 // deposit. A DAO/realm treasury has NO deposit path — a realm-routed
@@ -444,7 +464,12 @@ func Render(path string) string {
 	var b strings.Builder
 	b.WriteString("# Fee Split\n\n")
 
-	for _, id := range splitIDs {
+	show := splitIDs
+	if len(show) > MaxRenderSplits {
+		b.WriteString("_Showing the most recent " + strconv.Itoa(MaxRenderSplits) + " active splits._\n\n")
+		show = show[len(show)-MaxRenderSplits:]
+	}
+	for _, id := range show {
 		s := splits[id]
 		b.WriteString("## " + id + "\n\n")
 		if s == nil {

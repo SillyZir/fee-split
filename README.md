@@ -4,6 +4,16 @@
 
 Trustless, on-chain revenue splitting for Gno.land.
 
+## Deployment preconditions
+
+- **Unrestricted ugnot only.** On a token-locked network the bank gate is
+  sender-whitelist-based: a whitelisted user's deposit succeeds, but claims
+  send from this realm's (non-whitelisted) address and revert — funds would
+  flow in and not out. Deploy only where ugnot transfers are unrestricted,
+  or have governance whitelist the realm address first.
+- **Realm treasuries cannot deposit.** Deposits are direct user calls only;
+  a bare bank send to the realm address is an unrecoverable donation.
+
 ## Problem
 
 Every team that earns on-chain revenue — DAOs collecting protocol fees, freelancer collectives invoicing clients, validator teams pooling rewards — faces the same question: *who distributes the money, and why should anyone trust them?*

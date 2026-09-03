@@ -3,6 +3,7 @@ package fee_split
 import (
 	"chain"
 	"chain/banker"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -580,17 +581,48 @@ func TestCreateSplit_ShareSumWraparoundRejected(cur realm, t *testing.T) {
 	)
 }
 
-func TestGlobalCap_CountsActiveOnly(cur realm, t *testing.T) {
+func TestArchiveFreesActiveListAndOwnerSlot(cur realm, t *testing.T) {
 	resetState()
 	testing.SetRealm(testing.NewUserRealm(owner))
 
-	// re-audit P2: archived splits keep their audit record but must free
-	// their global slot — archive one, and creation must still work
 	id := CreateSplit(cross, addrList(alice), "10000")
 	Archive(cross, id)
 	uassert.Equal(t, 1, len(splits), "archived entry stays for audit")
 	uassert.Equal(t, 0, len(splitIDs), "archived entry frees the active list")
 	CreateSplit(cross, addrList(alice), "10000") // must not abort
+}
+
+func TestNoGlobalCap_SybilsCannotBlockOthers(cur realm, t *testing.T) {
+	resetState()
+
+	// round-4 P2: with per-owner quotas only, other owners filling their
+	// own budgets never block a legitimate creator
+	for i := 0; i < 30; i++ {
+		syb := testutils.TestAddress("sybil_" + strconv.Itoa(i))
+		testing.SetRealm(testing.NewUserRealm(syb))
+		for j := 0; j < MaxSplitsPerOwner; j++ {
+			CreateSplit(cross, addrList(alice), "10000")
+		}
+	}
+	uassert.Equal(t, 300, len(splitIDs))
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	CreateSplit(cross, addrList(alice), "10000") // must not abort
+}
+
+func TestPreParseInputBounds(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+
+	// round-4 P2: oversized inputs must be refused BEFORE parsing work
+	uassert.AbortsWithMessage(t,
+		"recipient list too long",
+		func() { CreateSplit(cross, strings.Repeat(",", MaxRecipientListLen+1), "10000") },
+	)
+	uassert.AbortsWithMessage(t,
+		"share list too long",
+		func() { CreateSplit(cross, addrList(alice), strings.Repeat("1,", MaxShareListLen)) },
+	)
 }
 
 func TestStraySendRejected(cur realm, t *testing.T) {
