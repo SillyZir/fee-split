@@ -4,6 +4,15 @@
 
 Trustless, on-chain revenue splitting for Gno.land.
 
+## Protocol fee
+
+The realm carries an optional protocol fee on deposits, **off by default**
+and hard-capped at **1% (100 bps) by an immutable constant** — the cap,
+not the current setting, is what users need to trust. Fees are taken at
+deposit time only (never retroactively from credited balances), accrue
+inside the realm, and are claimable by the fee admin (the deployer;
+transferable only via a two-step nominate/accept handover).
+
 ## Deployment preconditions
 
 - **Unrestricted ugnot only.** On a token-locked network the bank gate is

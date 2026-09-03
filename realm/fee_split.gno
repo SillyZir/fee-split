@@ -32,6 +32,11 @@ const (
 	// consumes only their own budget; state growth is gas-priced.
 	// Render is bounded separately (MaxRenderSplits).
 	MaxRenderSplits = 100
+	// MaxFeeBps is an IMMUTABLE ceiling on the protocol fee (1%). The
+	// admin can set any fee from 0 up to this cap, never above it — the
+	// cap, not the current setting, is what users must trust.
+	MaxFeeBps = int64(100)
+
 	// Pre-parse input bounds (round-4 audit): caps were enforced only
 	// AFTER full parsing, so a 1MB recipient list burned ~11B gas before
 	// refusal. 20 bech32 addresses + separators fit well within these.
@@ -52,6 +57,15 @@ var (
 	splitIDs    []string // insertion-ordered for deterministic Render
 	ownerSplits map[address]int
 	nextID      int
+
+	// Protocol fee: taken from each deposit BEFORE distribution, at the
+	// rate in force at deposit time (never retroactive — credited
+	// balances are never touched). Defaults to zero.
+	feeBps          int64
+	feeAdmin        address // deployer; can set the fee and claim accrued fees
+	pendingFeeAdmin address // two-step handover, must AcceptFeeAdmin
+	feesAccrued     int64
+	feesClaimed     int64
 )
 
 func init() {
@@ -59,6 +73,10 @@ func init() {
 	splitIDs = []string{}
 	ownerSplits = make(map[address]int)
 	nextID = 1
+	// The package deployer becomes the fee admin (AddPackage runs init
+	// with the creator as origin caller). Fee starts at ZERO.
+	feeAdmin = runtime.OriginCaller()
+	feeBps = 0
 }
 
 func caller() address {
@@ -275,6 +293,23 @@ func Deposit(_ realm, splitID string) {
 		panic("deposit would overflow split accounting")
 	}
 
+	// Protocol fee comes off the top; everything below distributes the
+	// NET amount, so the per-split conservation invariant
+	// (sum(balances)+TotalClaimed == TotalDeposited) is untouched.
+	// amount <= MaxDepositAmount and feeBps <= 100, so the product is
+	// far below overflow.
+	fee := (amount * feeBps) / 10000
+	if fee > 0 {
+		if feesAccrued > int64(9223372036854775807)-fee {
+			panic("fee accrual would overflow")
+		}
+		feesAccrued += fee
+		amount -= fee
+	}
+	if amount == 0 {
+		panic("deposit too small: fully consumed by the protocol fee")
+	}
+
 	s.TotalDeposited += amount
 
 	// Find the highest-share recipient for dust assignment
@@ -428,6 +463,77 @@ func Archive(_ realm, splitID string) {
 	}
 }
 
+// ---------- protocol fee ----------
+
+// SetFee sets the protocol fee in basis points, admin only, hard-capped
+// at MaxFeeBps. Applies to FUTURE deposits only.
+func SetFee(_ realm, bps int64) {
+	rejectStraySend()
+	if caller() != feeAdmin {
+		panic("only the fee admin can set the fee")
+	}
+	if bps < 0 || bps > MaxFeeBps {
+		panic("fee must be between 0 and " + strconv.FormatInt(MaxFeeBps, 10) + " basis points")
+	}
+	feeBps = bps
+}
+
+// ClaimFees sends all accrued protocol fees to the fee admin.
+func ClaimFees(_ realm) int64 {
+	rejectStraySend()
+	if caller() != feeAdmin {
+		panic("only the fee admin can claim fees")
+	}
+	if feesAccrued == 0 {
+		panic("no fees accrued")
+	}
+	amount := feesAccrued
+	feesAccrued = 0
+	feesClaimed += amount
+
+	b := banker.NewBanker(banker.BankerTypeRealmSend)
+	b.SendCoins(runtime.CurrentRealm().Address(), feeAdmin,
+		chain.Coins{{Denom: Denom, Amount: amount}})
+	return amount
+}
+
+// NominateFeeAdmin begins a two-step admin handover; the nominee must
+// AcceptFeeAdmin. Pass "" to clear a pending nomination. Two-step
+// because the admin address is a funds destination: a typo'd one-step
+// transfer would strand all future fees.
+func NominateFeeAdmin(_ realm, nominee address) {
+	rejectStraySend()
+	if caller() != feeAdmin {
+		panic("only the fee admin can nominate a successor")
+	}
+	if nominee == "" {
+		pendingFeeAdmin = ""
+		return
+	}
+	if !nominee.IsValid() || string(nominee) != strings.ToLower(string(nominee)) {
+		panic("invalid nominee address: " + string(nominee))
+	}
+	pendingFeeAdmin = nominee
+}
+
+// AcceptFeeAdmin completes the handover; only the nominee can accept.
+func AcceptFeeAdmin(_ realm) {
+	rejectStraySend()
+	if pendingFeeAdmin == "" || caller() != pendingFeeAdmin {
+		panic("caller is not the pending fee admin")
+	}
+	feeAdmin = pendingFeeAdmin
+	pendingFeeAdmin = ""
+}
+
+// GetFeeInfo returns the current fee configuration and accrued total.
+func GetFeeInfo() string {
+	return "fee: " + formatPct(feeBps) + " (cap " + formatPct(MaxFeeBps) +
+		") | admin: " + string(feeAdmin) +
+		" | accrued: " + strconv.FormatInt(feesAccrued, 10) +
+		" | claimed: " + strconv.FormatInt(feesClaimed, 10)
+}
+
 // ---------- read-only queries ----------
 
 // GetSplitInfo returns a human-readable summary.
@@ -463,6 +569,9 @@ func Render(path string) string {
 
 	var b strings.Builder
 	b.WriteString("# Fee Split\n\n")
+	if feeBps > 0 {
+		b.WriteString("**Protocol fee:** " + formatPct(feeBps) + " (hard cap " + formatPct(MaxFeeBps) + ")\n\n")
+	}
 
 	show := splitIDs
 	if len(show) > MaxRenderSplits {

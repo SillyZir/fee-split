@@ -27,7 +27,14 @@ func resetState() {
 	splitIDs = []string{}
 	ownerSplits = make(map[address]int)
 	nextID = 1
+	feeBps = 0
+	feeAdmin = feeAdminAddr
+	pendingFeeAdmin = ""
+	feesAccrued = 0
+	feesClaimed = 0
 }
+
+var feeAdminAddr = testutils.TestAddress("feeadmin")
 
 func addrList(addrs ...address) string {
 	parts := make([]string, len(addrs))
@@ -693,4 +700,138 @@ func TestRender_OnlyArchivedSplits(cur realm, t *testing.T) {
 
 	uassert.Equal(t, "# Fee Split\n\nNo active splits.\n", Render(""),
 		"archived-only state must render as no active splits")
+}
+
+// ---------- protocol fee (2026-09-03) ----------
+
+func TestFee_DefaultZeroAndCap(cur realm, t *testing.T) {
+	resetState()
+	uassert.Equal(t, int64(0), feeBps)
+
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	uassert.AbortsContains(t, "fee must be between 0 and",
+		func() { SetFee(cross, MaxFeeBps+1) })
+	uassert.AbortsContains(t, "fee must be between 0 and",
+		func() { SetFee(cross, -1) })
+	SetFee(cross, MaxFeeBps) // exactly the cap is allowed
+	uassert.Equal(t, MaxFeeBps, feeBps)
+
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t, "only the fee admin can set the fee",
+		func() { SetFee(cross, 1) })
+}
+
+func TestFee_TakenFromDepositNetAccounting(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	SetFee(cross, 50) // 0.5%
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice, bob), "5000,5000")
+	deposit(owner, id, 10000)
+
+	s := splits[id]
+	// fee 50 off the top; 9950 net distributed (4975 + 4975)
+	uassert.Equal(t, int64(50), feesAccrued)
+	uassert.Equal(t, int64(9950), s.TotalDeposited)
+	uassert.Equal(t, int64(4975), s.Balances[alice])
+	uassert.Equal(t, int64(4975), s.Balances[bob])
+	// conservation on net amounts holds untouched
+	uassert.Equal(t, s.TotalDeposited, s.Balances[alice]+s.Balances[bob]+s.TotalClaimed)
+}
+
+func TestFee_NeverRetroactive(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 10000) // fee 0 at deposit time
+
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	SetFee(cross, MaxFeeBps)
+
+	// the previously credited balance is untouched by the fee change
+	uassert.Equal(t, int64(10000), splits[id].Balances[alice])
+	testing.SetRealm(testing.NewUserRealm(alice))
+	uassert.Equal(t, int64(10000), Claim(cross, id))
+}
+
+func TestFee_ClaimFeesSendsCoins(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	SetFee(cross, 100) // 1%
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 50000) // fee 500
+
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t, "only the fee admin can claim fees",
+		func() { ClaimFees(cross) })
+
+	before := banker.NewBanker(banker.BankerTypeReadonly).GetCoins(feeAdminAddr).AmountOf(Denom)
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	uassert.Equal(t, int64(500), ClaimFees(cross))
+	after := banker.NewBanker(banker.BankerTypeReadonly).GetCoins(feeAdminAddr).AmountOf(Denom)
+	uassert.Equal(t, int64(500), after-before)
+	uassert.Equal(t, int64(0), feesAccrued)
+	uassert.Equal(t, int64(500), feesClaimed)
+
+	uassert.AbortsWithMessage(t, "no fees accrued", func() { ClaimFees(cross) })
+}
+
+func TestFee_TinyDepositFullyConsumedRefused(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	SetFee(cross, MaxFeeBps) // 1%
+
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	// amounts < 100 at 1% round the fee to 0 — deposit passes whole
+	deposit(owner, id, 99)
+	uassert.Equal(t, int64(0), feesAccrued)
+	uassert.Equal(t, int64(99), splits[id].Balances[alice])
+}
+
+func TestFee_TwoStepAdminHandover(cur realm, t *testing.T) {
+	resetState()
+	newAdmin := testutils.TestAddress("newfeeadmin")
+
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t, "only the fee admin can nominate a successor",
+		func() { NominateFeeAdmin(cross, attacker) })
+
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	uassert.AbortsContains(t, "invalid nominee address",
+		func() { NominateFeeAdmin(cross, address("JUNK")) })
+	NominateFeeAdmin(cross, newAdmin)
+	// nomination alone changes nothing
+	uassert.Equal(t, string(feeAdminAddr), string(feeAdmin))
+
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	uassert.AbortsWithMessage(t, "caller is not the pending fee admin",
+		func() { AcceptFeeAdmin(cross) })
+
+	testing.SetRealm(testing.NewUserRealm(newAdmin))
+	AcceptFeeAdmin(cross)
+	uassert.Equal(t, string(newAdmin), string(feeAdmin))
+	uassert.Equal(t, "", string(pendingFeeAdmin))
+
+	// clearing a nomination works
+	testing.SetRealm(testing.NewUserRealm(newAdmin))
+	NominateFeeAdmin(cross, feeAdminAddr)
+	NominateFeeAdmin(cross, "")
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	uassert.AbortsWithMessage(t, "caller is not the pending fee admin",
+		func() { AcceptFeeAdmin(cross) })
+}
+
+func TestFee_StraySendRejectedOnFeeFunctions(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	testing.SetOriginSend(chain.Coins{{Denom: Denom, Amount: 5}})
+	uassert.AbortsWithMessage(t,
+		"this function does not accept coins; attach coins to Deposit only",
+		func() { SetFee(cross, 10) },
+	)
+	testing.SetOriginSend(nil)
 }
