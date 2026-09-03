@@ -835,3 +835,73 @@ func TestFee_StraySendRejectedOnFeeFunctions(cur realm, t *testing.T) {
 	)
 	testing.SetOriginSend(nil)
 }
+
+// ---------- round-5 audit regressions (fee path, 2026-09-03) ----------
+
+// Pins the benign-degradation safety property: an empty fee admin (the
+// gno-test-VM init state, and any hypothetical empty-origin deploy)
+// leaves the fee permanently disabled and zero funds at risk — SetFee
+// can never be authorized, so feeBps stays 0 and nothing accrues.
+func TestFee_EmptyAdminDegradesToDisabled(cur realm, t *testing.T) {
+	resetState()
+	feeAdmin = ""
+	feeBps = 0
+
+	for _, who := range []address{owner, alice, feeAdminAddr, attacker} {
+		testing.SetRealm(testing.NewUserRealm(who))
+		uassert.AbortsWithMessage(t, "only the fee admin can set the fee",
+			func() { SetFee(cross, 100) })
+	}
+	uassert.Equal(t, int64(0), feeBps, "fee must remain 0 with no reachable admin")
+
+	// a deposit accrues nothing
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 10000)
+	uassert.Equal(t, int64(0), feesAccrued)
+	testing.SetRealm(testing.NewUserRealm(alice))
+	uassert.Equal(t, int64(10000), Claim(cross, id)) // full amount, no fee
+}
+
+// Fees accrued before a handover are claimable by the NEW admin
+// (documented semantics: claim before transferring if that matters).
+func TestFee_HandoverTransfersAccruedClaimRight(cur realm, t *testing.T) {
+	resetState()
+	newFa := testutils.TestAddress("newfa")
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	SetFee(cross, 100)
+	testing.SetRealm(testing.NewUserRealm(owner))
+	id := CreateSplit(cross, addrList(alice), "10000")
+	deposit(owner, id, 100000) // 1000 accrued under the original admin
+
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	NominateFeeAdmin(cross, newFa)
+	testing.SetRealm(testing.NewUserRealm(newFa))
+	AcceptFeeAdmin(cross)
+	uassert.Equal(t, int64(1000), ClaimFees(cross), "new admin claims prior-regime fees")
+
+	// the old admin can no longer claim — fails the authorization check
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	uassert.AbortsWithMessage(t, "only the fee admin can claim fees", func() { ClaimFees(cross) })
+}
+
+// Every fee function rejects an attached send (only SetFee was pinned).
+func TestFee_AllFunctionsRejectStraySend(cur realm, t *testing.T) {
+	resetState()
+	testing.SetRealm(testing.NewUserRealm(feeAdminAddr))
+	send := chain.Coins{{Denom: Denom, Amount: 3}}
+	msg := "this function does not accept coins; attach coins to Deposit only"
+
+	testing.SetOriginSend(send)
+	uassert.AbortsWithMessage(t, msg, func() { SetFee(cross, 10) })
+	uassert.AbortsWithMessage(t, msg, func() { NominateFeeAdmin(cross, attacker) })
+	uassert.AbortsWithMessage(t, msg, func() { ClaimFees(cross) })
+	testing.SetOriginSend(nil)
+
+	// AcceptFeeAdmin from the pending side, also with a send
+	NominateFeeAdmin(cross, attacker)
+	testing.SetRealm(testing.NewUserRealm(attacker))
+	testing.SetOriginSend(send)
+	uassert.AbortsWithMessage(t, msg, func() { AcceptFeeAdmin(cross) })
+	testing.SetOriginSend(nil)
+}

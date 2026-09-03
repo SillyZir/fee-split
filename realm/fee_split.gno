@@ -73,8 +73,15 @@ func init() {
 	splitIDs = []string{}
 	ownerSplits = make(map[address]int)
 	nextID = 1
-	// The package deployer becomes the fee admin (AddPackage runs init
-	// with the creator as origin caller). Fee starts at ZERO.
+	// The package deployer becomes the fee admin: on-chain, AddPackage
+	// runs init with the message creator as origin caller (verified
+	// against the VM keeper — a MsgAddPackage's creator is never zero).
+	// If OriginCaller() were ever empty (e.g. the gno test VM, which has
+	// no MsgAddPackage), the fee feature degrades SAFELY to disabled:
+	// SetFee requires caller()==feeAdmin and caller() is never empty, so
+	// feeBps can never leave 0 and no fee ever accrues — zero funds at
+	// risk. Do not "harden" this into a panic; the soft-disable is the
+	// safe behavior. Fee starts at ZERO regardless.
 	feeAdmin = runtime.OriginCaller()
 	feeBps = 0
 }
